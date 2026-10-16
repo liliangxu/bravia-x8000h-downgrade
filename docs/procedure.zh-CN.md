@@ -75,17 +75,18 @@ https://tv-update.sony.com.cn/URL_archive/zip/sony_atvotafull_2018_<版本号>_c
 ### 引导器源码（不是固件）
 
 ```
-https://oss.sony.net/Products/Linux/TV/<机型页>.html
+https://oss.sony.net/Products/Linux/TV/KD-65A9F_Asia_Ver66230.html
 ```
 
-这里发布的是 GPL 源码包，U-Boot 约 49 MB。本文引用的源码路径都以它为准。**它和固件包
-是两回事**：源码用来核对逻辑，固件才是要写进设备的东西。
+对应 U-Boot 源码包 49,312,462 字节，MD5 `d1ecfa04477150694b3dac47390563e9`。本文引用的
+源码路径都以它为准。**它和固件包是两回事**：源码用来核对逻辑，固件才是要写进设备的东西。
 
 ### 可获取性
 
 CDN 上的历史版本会被清理。如果某个版本的包已经拿不到，就换一个比当前版本旧、且能拿到
-完整包的版本。方法本身和版本无关：换哪个旧版本，第 0 步的做法都一样，索引都取自设备
-当前运行的版本。
+完整包的版本。方法不绑定某一个旧版本，第 0 步的做法对哪个版本都一样，索引都取自设备
+当前运行的版本。不过只在上面那组固件上验证过，换版本时分区布局、更新组件和引导器的
+行为是否一致，需要自行确认。
 
 ---
 
@@ -102,8 +103,9 @@ bash tools/inspect-vbmeta.sh vbmeta_current.img
 # 记住输出里的 Rollback Index
 ```
 
-**是当前版本，不是要装进去的旧版本。** RPMB 里存的是设备上出现过的最高版本索引，
-替换头必须与它相等。取旧版本的值会被判据挡下。
+**是当前版本，不是要装进去的旧版本。** 拒绝条件是镜像索引低于设备存值，取旧版本的值会
+被挡下。采用当前镜像的值可以让判据成立，同时不把存值抬高，前提是设备存值与当前镜像
+一致。设备实际存的值没有直接读过，这一点见[研究记录](research.zh-CN.md#为什么降不了)。
 
 **这个值也不能猜。** 填大了会把 RPMB 永久抬高，填小了会被拒绝启动。
 
@@ -124,7 +126,7 @@ bash tools/inspect-vbmeta.sh vbmeta_patched.img
 | 大小 | 8192 字节 |
 | Rollback Index | 与你从当前固件读到的值相等 |
 
-实测那台机器读到的索引是 `16062301000725`，仅供参考格式。**不要照抄这个数字。**
+实测那台机器跑的是 6.6230，从它的镜像读到 `16062301000725`，仅供参考格式。**不要照抄这个数字。**
 
 生成新密钥会让镜像哈希变化，核对上面这些字段即可。
 
@@ -140,8 +142,7 @@ adb shell getprop ro.boot.slot_suffix
 
 返回 `_a` 或 `_b`。**旧固件要写进另一个槽**：当前是 `_b` 就写 A，是 `_a` 就写 B。
 
-写进正在运行的那个槽，等于把系统换成旧版本，而它的元数据还是新的。重启后判据不成立，
-旧系统起不来；两个槽都成了新的，没有可回退的地方。
+写进正在运行的那个槽，会破坏当前可用的系统。所以这里用的是非活动槽。
 
 这一步有两个做法，本文不展开：
 
@@ -174,8 +175,8 @@ fastboot devices
 fastboot flashing unlock
 ```
 
-**这一步会清空用户数据。** 不做这步，后面的 `flash` 会被拒：
-`device locked, forbid to write flash.`
+解锁会提交清除用户数据的请求，但命令返回成功不代表格式化已经完成，后面第 8 步仍要恢复
+出厂。不做这步，后面的 `flash` 会被拒：`device locked, forbid to write flash.`
 
 ---
 
@@ -227,8 +228,8 @@ fastboot reboot
 
 **这一步不能省，也不能用软件方式代替。**
 
-不要用 `fastboot erase userdata` 顶替。这条命令在这个平台上只发 TRIM，数据一个字节
-没动。
+不要用 `fastboot erase userdata` 顶替。这条命令约 0.05 秒就返回，之后开机的表现和没跑过
+一样，没有解决后续启动的问题。
 
 ```
 ① 拔掉电视电源线，等约 30 秒
@@ -252,8 +253,8 @@ adb shell getprop ro.boot.verifiedbootstate       # 期望 orange
 adb shell getprop sys.boot_completed              # 期望 1
 ```
 
-前两项对着你实际装的包和选的槽看。`verifiedbootstate` 是 `orange` 就说明验证已关闭、
-用的是替换后的元数据。
+前两项对着你实际装的包和选的槽看。`verifiedbootstate` 是 `orange`，表示引导器处于已解锁
+状态，与本次操作后的状态一致；它不能单独说明替换的镜像正在生效。
 
 `tools/check-state.sh` 会把这些属性连同系统版本、型号、vbmeta 状态一次打出来。它只读，
 不执行任何包管理、设置修改、重启或分区写入命令。
@@ -264,24 +265,26 @@ adb shell getprop sys.boot_completed              # 期望 1
 
 ```bash
 adb shell reboot bootloader
-fastboot set_active <另一个槽>
 fastboot erase misc
+fastboot set_active <另一个槽>
 fastboot reboot
 ```
 
-然后同样用组合键再做一次恢复出厂。用户数据对不上这件事，两个方向都会发生。
+顺序和第 5、6 步一致：先清 `misc`，再选槽。然后同样用组合键再做一次恢复出厂。
+
+**这一节没有实测过**，只是按正向流程的规则反推出来的。
 
 ---
 
-## 会把设备搞坏的操作
+## 需要避免的操作
 
 | | |
 | --- | --- |
-| `fastboot flashing lock` | 之后 `erase misc` 会被拒，就出不来 fastboot 了 |
-| `fastboot flash uboot ...` | 破坏引导器签名，永久变砖 |
-| 用 `fastboot erase userdata` 当清数据 | 只发 TRIM，数据还在 |
+| `fastboot flashing lock` | 修改后的元数据不应配合重新锁定使用 |
+| `fastboot flash uboot ...` | 错误刷写引导器可能导致无法启动，恢复方法未验证 |
+| 用 `fastboot erase userdata` 当清数据 | 约 0.05 秒返回，但没有解决后续启动问题 |
 | 往 `userdata` 写零 | Android 既不挂载也不格式化 |
-| 往活动槽写旧固件 | 覆盖正在运行的系统，且没有可回退的槽 |
+| 往活动槽写旧固件 | 破坏当前可用的系统 |
 | 跳过第 8 步 | 旧系统读不了新的用户数据 |
-| 让设备重新联网升级 | OTA 会立刻扑上来，把降级成果抹掉 |
+| 让设备重新联网升级 | 后续 OTA 可能覆盖替换的元数据，影响降级后的启动 |
 

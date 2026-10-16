@@ -8,6 +8,10 @@ firmware gets into a slot, why it would not start once it was there, and what ma
 The method is not tied to those two versions. The steps themselves are in the
 [procedure](procedure.md).
 
+Code quoted below carries its file path and line number so it can be checked against the
+corresponding source package. The excerpts are verbatim apart from two things: the block is
+shifted left to suit the excerpt, and omitted lines are replaced with `...`.
+
 ---
 
 ## Result
@@ -33,7 +37,9 @@ package .zip
         └── unpacked → boot.img / system.img / vendor.img / dtbo.img / ...
 ```
 
-`fastboot flash` can do this once the device is unlocked.
+`payload.bin` is not an archive; pulling the per-partition images out of it needs a
+dedicated A/B payload dumper, such as `payload-dumper-go`. `fastboot flash` then writes
+them into the slot, once the device is unlocked.
 
 **Submission through the update service.** The device carries a network download service:
 hand it an address and it fetches the OTA package and installs it. This route runs the whole
@@ -51,8 +57,8 @@ bootable**, which is what the rest of this note is about.
 Two values first:
 
 ```
-vbmeta.rollback_index (6.5086)  =  16050861000636
-stored_rollback_index in RPMB   =  16062301000725
+rollback_index in the 6.5086 image  =  16050861000636
+rollback_index in the 6.6230 image  =  16062301000725
 
 test:  16050861000636 < 16062301000725
     →  AVB_SLOT_VERIFY_RESULT_ERROR_ROLLBACK_INDEX
@@ -60,23 +66,47 @@ test:  16050861000636 < 16062301000725
     →  the other slot is tried
 ```
 
-Both numbers come from firmware package versions. The RPMB one was raised by an automatic
-update (6.6188 → 6.6230) and cannot be lowered from userspace.
+Both numbers are read from the **firmware images**, and track the package versions.
+
+The value actually stored on the device cannot be read: RPMB is not reachable from userspace.
+It is inferred from the last version installed — after the automatic update to 6.6230, the
+stored value should be that of 6.6230. Step 0 uses this inferred value, and the device booting
+afterwards is consistent with it.
 
 `ALLOW_VERIFICATION_ERROR` does not help either:
 
 ```c
-if (ret == AVB_SLOT_VERIFY_RESULT_ERROR_ROLLBACK_INDEX) {
-    /* Even with AVB_SLOT_VERIFY_FLAGS_ALLOW_VERIFICATION_ERROR
-     * these mean game over. */
-    set_slot_unbootable = true;
+/* lib/libavb_ab/avb_ab_flow.c:282 */
+case AVB_SLOT_VERIFY_RESULT_ERROR_ROLLBACK_INDEX:
+case AVB_SLOT_VERIFY_RESULT_ERROR_INVALID_METADATA:
+case AVB_SLOT_VERIFY_RESULT_ERROR_UNSUPPORTED_VERSION:
+  /* Even with AVB_SLOT_VERIFY_FLAGS_ALLOW_VERIFICATION_ERROR
+   * these mean game over.
+   */
+  set_slot_unbootable = true;
+  break;
+```
+
+The comparison itself is in the verifier:
+
+```c
+/* lib/libavb/avb_slot_verify.c:675 */
+if (vbmeta_header.rollback_index < stored_rollback_index) {
+  avb_errorv(
+      full_partition_name,
+      ": Image rollback index is less than the stored rollback index.\n",
+      NULL);
+  ret = AVB_SLOT_VERIFY_RESULT_ERROR_ROLLBACK_INDEX;
+  if (!allow_verification_error) {
+    goto out;
+  }
 }
 ```
 
 ### The update path is not a way back either
 
-Every front-end update route runs `isNewerThanRunningVersion()`, which rejects a package
-whose version is the same as or lower than the running build. Submitting the original
+The ordinary update front end tried here runs `isNewerThanRunningVersion()`, which rejects a
+package whose version is the same as or lower than the running build. Submitting the original
 6.5086 inner ZIP through one of the device's privileged update channels returned:
 
 ```json
@@ -90,26 +120,35 @@ check was `isNewerThanRunningVersion()`.
 
 ## The way around it
 
-The RPMB side cannot be touched, but `vbmeta_a` can be replaced. The replacement satisfies
-three conditions:
+The RPMB side cannot be touched, but `vbmeta_a` can be replaced. Two fields in the
+replacement have to be right:
 
 | Field | Value | Effect |
 | --- | --- | --- |
-| `rollback_index` | `16062301000725`, **equal** to the current value | The test `stored < stored` is false, so no rollback error is raised. Equal rather than maximal, because `avb_ab_flow` writes the slot's index back to RPMB, and a large value would have irreversible effects |
-| `flags` | `2` (VERIFICATION_DISABLED) | Line 1412 uses this to supply `root=PARTUUID=$(ANDROID_SYSTEM_PARTUUID)`; U-Boot's own bootargs carry no `root=` |
-| descriptors | none | The original vbmeta's six `Chain Partition` entries each carry their own rollback index (locations 1/3/4/5/6/7) |
+| `rollback_index` | `16062301000725`, taken from the current image | The check rejects an image index below the stored value. Taking the current image's value satisfies the check without raising the stored value, assuming the stored value matches the current image; `avb_ab_flow` writes the slot's index back to RPMB, and a large value would have irreversible effects |
+| `flags` | `2` (VERIFICATION_DISABLED) | Line 1412 uses this to supply `root=PARTUUID=$(ANDROID_SYSTEM_PARTUUID)`; U-boot's own bootargs carry no `root=` |
+
+The image built at the time carried no descriptors either. The original vbmeta has six
+`Chain Partition` entries with their own rollback indices (locations 1/3/4/5/6/7); `flags=2`
+already skips descriptor processing, so this is not a further precondition for passing the
+check, only what the generated image happened to look like.
 
 The signature comes from a locally generated RSA-2048 key, untrusted on purpose.
 
-`avb_ab_flow.c:295` handles `ERROR_PUBLIC_KEY_REJECTED` like this:
+`avb_ab_flow.c:292` handles `ERROR_PUBLIC_KEY_REJECTED` like this:
 
 ```c
+/* lib/libavb_ab/avb_ab_flow.c:292 */
+case AVB_SLOT_VERIFY_RESULT_ERROR_VERIFICATION:
 case AVB_SLOT_VERIFY_RESULT_ERROR_PUBLIC_KEY_REJECTED:
-    if (flags & AVB_SLOT_VERIFY_FLAGS_ALLOW_VERIFICATION_ERROR) {
-        saw_and_allowed_verification_error = true;   /* allowed */
-    } else {
-        set_slot_unbootable = true;
-    }
+  if (flags & AVB_SLOT_VERIFY_FLAGS_ALLOW_VERIFICATION_ERROR) {
+    /* Do nothing since we allow this. */
+    avb_debugv("Allowing slot ", ...);
+    saw_and_allowed_verification_error = true;
+  } else {
+    set_slot_unbootable = true;
+  }
+  break;
 ```
 
 The production build sets that flag (`CC_ANDROID_SECURE_BOOT_CLASS_B` is defined in
@@ -123,10 +162,11 @@ needs to be forged.
 `avb_ab_flow` writes the index back to RPMB at the end of the boot flow:
 
 ```c
+/* lib/libavb_ab/avb_ab_flow.c:404 */
 if (ab_data.slots[slot_index_to_boot].successful_boot
-    && current_rollback_index_value != rollback_index_value)
-{
-    io_ret = ops->write_rollback_index(ops, n, rollback_index_value);
+  && current_rollback_index_value != rollback_index_value) {
+  io_ret = ops->write_rollback_index(ops, n, rollback_index_value);
+  ...
 }
 ```
 
@@ -152,29 +192,54 @@ It is not: the marker does not have to be written by hand. **The kernel writes i
 ### The kernel writes the marker
 
 ```c
-// board/mt5893/module/pdwnc_hw.c:1319 — compiled into dtv_driver.ko
-if(event == SYS_RESTART) {
-    if(cmd && !x_memcmp(cmd, "bootloader", 10)) {
-        msdc_partwrite_byname("misc", 512, sizeof("fastboot"), "fastboot");
+/* board/mt5893/module/pdwnc_hw.c:1324 */
+if(event == SYS_RESTART)
+{
+    #ifdef CC_ANDROID_FASTBOOT_SUPPORT
+    if(cmd && !x_memcmp(cmd, "bootloader", 10))
+    {
+        int u4Val = msdc_partwrite_byname("misc",512,sizeof("fastboot"),(void *)"fastboot");
+        if(u4Val == -1)
+        LOG(0,"\n writer misc partition failed \n");
     }
+    #endif
+    ...
 }
 ```
 
 ### The bootloader reads it
 
 ```c
-// board/mt5893/mt5893_board.c — BIM_CheckFastboot()
-emmc_read_from_partition(pmisc_msg, "misc", 512, size);
-if(strcmp(pmisc_msg->command, "fastboot")==0)  return 1;
+/* board/mt5893/mt5893_board.c:1343 */
+INT32 BIM_CheckFastboot(void)
+{
+    misc_message *pmisc_msg;
+    ...
+    pmisc_msg = memalign(DCACHE_LINE_SIZE,size);
+    ...
+    emmc_read_from_partition((unsigned char*)pmisc_msg, "misc", 512, size);
+    ...
+    if(strcmp(pmisc_msg->command, "fastboot")==0)
+    {
+        ...
+        return 1;
+    }
+    ...
+}
 ```
 
 ### And acts on it
 
 ```c
-// common/main.c
-if (BIM_CheckFastboot()) {
+/* common/main.c:437 */
+if (BIM_CheckFastboot())
+{
+    char *newstr;
+    newstr = env_add_usb_serialno();
+    surf_udc_device.serialno = newstr;
     udc_init(&surf_udc_device);
-    if (fastboot_init() == 0) {
+    if (fastboot_init() == 0)
+    {
         udc_start();
         watchdog_disable();
         fastboot_command_loop();
@@ -191,16 +256,21 @@ and `boot-recovery` sit adjacent and in the same order as the source.**
 ### The unlock command
 
 ```c
-// common/download_command.c — do_flashing()
-else if (strcmp("unlock", TempData) == 0) {
-    fastboot_info("wipe user data");
-    EraseUserData();
-    setenv("devicestate", TempData);
-    saveenv();
+/* common/download_command.c:646 */
+else if (strcmp("lock", TempData) == 0 || strcmp("unlock", TempData) == 0)
+{
+    if (dev_state != NULL && strcmp(dev_state, TempData) != 0)
+    {
+        fastboot_info("wipe user data");
+        EraseUserData();
+        setenv("devicestate", TempData);
+        saveenv();
+    }
 }
 ```
 
-So `fastboot flashing unlock`, at the cost of erasing user data.
+So `fastboot flashing unlock` takes this branch. It writes a request to clear user data into
+`misc`; see the userdata section below.
 
 ### Port and cable
 
@@ -221,9 +291,9 @@ first two were wrong.
 
 | Approach | Result |
 | --- | --- |
-| `fastboot erase userdata` | **takes 0.05 s — it only issues a TRIM; not one byte of data moved** |
+| `fastboot erase userdata` | returns in about 0.05 s; booting afterwards behaves as if it had not been run |
 | writing 1 GB of zeros at the start of userdata | takes 36 s (so the write really happens); the filesystem metadata is destroyed → Android **does not reformat** → stuck on the boot animation for over 17 minutes |
-| **hardware factory reset** | the loader performs a real format → the system starts normally |
+| **hardware factory reset** | the system starts normally |
 
 ### Why writing zeros is wrong
 
@@ -246,9 +316,6 @@ assumption is wrong.
 5. wait 3–10 minutes (the screen shows "erasing")
 ```
 
-The important part: this is handled by the standby MCU, which **runs before Android does**,
-so it can be triggered even when Android will not start at all.
-
-Measured: the screen shows `erasing`, then a reboot, then the setup wizard, with the data
-correctly formatted.
+Measured: with Android unable to start at all, the key combination still triggered the
+factory reset — the screen showed `erasing`, then a reboot, then the setup wizard.
 

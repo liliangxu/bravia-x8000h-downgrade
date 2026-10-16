@@ -81,10 +81,10 @@ https://tv-update.sony.com.cn/URL_archive/zip/sony_atvotafull_2018_<version>_cna
 ### Bootloader source (not firmware)
 
 ```
-https://oss.sony.net/Products/Linux/TV/<model-page>.html
+https://oss.sony.net/Products/Linux/TV/KD-65A9F_Asia_Ver66230.html
 ```
 
-This is where the GPL source archives are published; the U-Boot one is about 49 MB. The
+The U-Boot source package there is 49,312,462 bytes, MD5 `d1ecfa04477150694b3dac47390563e9`. The
 source paths cited in these notes are relative to it. **It is a different thing from the
 firmware package**: the source is what makes the logic checkable, the firmware is what gets
 written to the device.
@@ -93,8 +93,10 @@ written to the device.
 
 Historical versions are pruned from the CDN. If a particular version can no longer be
 obtained, use any version older than your current one whose complete package you can get.
-The method is not version-specific: whichever older version you pick, step 0 works the same
-way, with the index taken from what the device is currently running.
+The method is not tied to one older version: step 0 works the same way whichever you pick,
+with the index taken from what the device is currently running. It has only been verified on
+the combination above, so on another version the partition layout, update components and
+bootloader behaviour are yours to confirm.
 
 ---
 
@@ -112,9 +114,11 @@ bash tools/inspect-vbmeta.sh vbmeta_current.img
 # note the Rollback Index in the output
 ```
 
-**The current version, not the older one you are about to install.** RPMB holds the index of
-the highest version that has been on the device, and the replacement has to be equal to it.
-Taking the older package's value fails the check.
+**The current version, not the older one you are about to install.** The check rejects an
+image index below the stored value, so taking the older package's value fails. Using the
+current image's value satisfies the check without raising the stored value, assuming the
+stored value matches the current image. The stored value itself was not read directly; see
+the [research notes](research.md#why-it-would-not-boot).
 
 **Do not guess this value either.** Too large and the RPMB value is raised permanently; too
 small and the boot is rejected.
@@ -136,8 +140,8 @@ The result should show:
 | Size | 8192 bytes |
 | Rollback Index | equal to the value you read from the current firmware |
 
-The index read on the tested device was `16062301000725`, given only to show the format.
-**Do not copy that number.**
+The tested device ran 6.6230; its image carries `16062301000725`, given only to show the
+format. **Do not copy that number.**
 
 A fresh signing key changes the image hash, so compare the fields above rather than the
 hash.
@@ -155,9 +159,8 @@ adb shell getprop ro.boot.slot_suffix
 It returns `_a` or `_b`. **The older firmware goes into the other one** — write A if it
 says `_b`, B if it says `_a`.
 
-Writing into the running slot replaces the system with the older one while its metadata is
-still the new version. On reboot the check fails and the older system will not start, and
-both slots are then new, so there is nothing to fall back to.
+Writing into the running slot destroys the system that is currently working. That is why the
+inactive slot is the one used here.
 
 Two ways to do this; neither is expanded here:
 
@@ -194,8 +197,9 @@ normal.
 fastboot flashing unlock
 ```
 
-**This erases user data.** Without it the later `flash` fails with
-`device locked, forbid to write flash.`
+Unlocking submits a request to clear user data, but the command returning success does not
+mean the format has happened — step 8 still does that. Without unlocking, the later `flash`
+fails with `device locked, forbid to write flash.`
 
 ---
 
@@ -249,8 +253,8 @@ The device starts the older firmware. First boot takes a while.
 
 **Do not skip this, and do not substitute a software wipe.**
 
-Do not reach for `fastboot erase userdata` instead. On this platform that command issues a
-TRIM and moves no data at all.
+Do not reach for `fastboot erase userdata` instead. It returns in about 0.05 s, booting
+afterwards behaves as if it had not been run, and it does not fix the boot problem.
 
 ```
 1. unplug the TV, wait ~30 seconds
@@ -275,8 +279,9 @@ adb shell getprop sys.boot_completed              # expect 1
 ```
 
 The first two are judged against what you actually installed and selected.
-`verifiedbootstate` reading `orange` means verification is off and the replaced metadata is
-in use.
+`verifiedbootstate` reading `orange` means the bootloader is in the unlocked state, which
+matches the state after this procedure; on its own it does not show that the replaced image
+is in use.
 
 `tools/check-state.sh` prints these along with the system version, model and vbmeta state in
 one go. It only reads; it issues no package, settings, reboot or partition-write commands.
@@ -287,25 +292,28 @@ one go. It only reads; it issues no package, settings, reboot or partition-write
 
 ```bash
 adb shell reboot bootloader
-fastboot set_active <the other slot>
 fastboot erase misc
+fastboot set_active <the other slot>
 fastboot reboot
 ```
 
-Then factory reset from the key combination again. The userdata mismatch happens in both
-directions.
+The order matches steps 5 and 6: clear `misc` first, then select the slot. Then factory reset
+from the key combination again.
+
+**This section was not tested.** It follows from the rules of the forward procedure rather
+than from a run.
 
 ---
 
-## Things that will break the device
+## Things to avoid
 
 | | |
 | --- | --- |
-| `fastboot flashing lock` | `erase misc` is then refused, and there is no way out of fastboot |
-| `fastboot flash uboot ...` | breaks the bootloader signature; permanent brick |
-| `fastboot erase userdata` as the wipe | issues a TRIM only; data survives |
+| `fastboot flashing lock` | modified metadata should not be used together with relocking |
+| `fastboot flash uboot ...` | a bad bootloader write may leave the device unable to start; recovery is unverified |
+| `fastboot erase userdata` as the wipe | returns in about 0.05 s but does not fix the boot |
 | writing zeros over `userdata` | Android neither mounts nor formats it |
-| writing the older firmware into the active slot | overwrites the running system, with no slot left to fall back to |
+| writing the older firmware into the active slot | destroys the system that currently works |
 | skipping step 8 | the older system cannot read the newer userdata |
-| letting the device back online to update | the OTA arrives immediately and undoes the work |
+| letting the device back online to update | a later OTA may overwrite the replacement metadata and affect booting after the downgrade |
 
