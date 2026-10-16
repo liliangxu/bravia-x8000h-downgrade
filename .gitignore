@@ -1,0 +1,8 @@
+# Local artifacts; firmware and keys are not part of the publication.
+.DS_Store
+__pycache__/
+*.pyc
+*.img
+*.pem
+*.zip
+*.log
