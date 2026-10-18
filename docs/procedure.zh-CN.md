@@ -261,6 +261,174 @@ adb shell getprop sys.boot_completed              # 期望 1
 
 ---
 
+## 处理待机卡死
+
+这里给原有的两个 Widevine 服务配置软件 L3 路径。卡住的 L1 调用怎样拖住音频和电源流程，
+见[研究记录](research.zh-CN.md#降级后的待机卡死)。
+
+输入文件用电视当前所装固件解出的原版 raw `vendor.img`。电视已经完成降级，引导器保持
+解锁，使用前面生成的关闭验证的 vbmeta。下面以旧系统正在运行的槽 A 为例。
+
+电脑上另外需要 e2fsprogs 的 `debugfs`、`e2fsck`，Android libsparse 的 `img2simg`、
+`simg2img`，以及 `avbtool` 能调用的 Android `fec`，后者要在 `PATH` 中。
+`AVBTOOL` 沿用第 0 步设置的路径，下列镜像处理命令均在电脑上执行。
+
+### 准备镜像，取出配置
+
+把解出的原版镜像留作 `vendor.original.img`。在本地建一个 `vendor-work/` 目录，后面
+只修改工作副本 `vendor.img`。
+
+```bash
+# 电脑端文件：vendor-work/vendor.original.img、vendor-work/vendor-avb.txt
+mkdir vendor-work
+cp /path/to/extracted/vendor.img vendor-work/vendor.original.img
+cd vendor-work
+shasum -a 256 vendor.original.img
+python3 "$AVBTOOL" info_image --image vendor.original.img > vendor-avb.txt
+```
+
+从这份 vendor 镜像里读出分区大小、回滚索引和 salt。重建 footer 时保留 vendor 自己的
+这些参数；前面替换用的顶层 vbmeta 有它自己的回滚索引，两处分别处理。
+
+```bash
+# 电脑端输入：vendor-work/vendor-avb.txt
+vendor_size=$(awk '/^Image size:/ {print $3}' vendor-avb.txt)
+vendor_index=$(awk '/^Rollback Index:/ {print $3}' vendor-avb.txt)
+vendor_salt=$(awk '/^[[:space:]]*Salt:/ {print $2}' vendor-avb.txt)
+```
+
+取出两个 init 配置。镜像内路径从 `/etc` 开始，装到电视上后才是 `/vendor/etc`。
+
+```bash
+# 电脑端输出：vendor-work/widevine-1.1.rc、vendor-work/drm-1.0.rc
+debugfs -R 'dump /etc/init/android.hardware.drm@1.1-service.widevine.rc widevine-1.1.rc' vendor.original.img
+debugfs -R 'dump /etc/init/android.hardware.drm@1.0-service.rc drm-1.0.rc' vendor.original.img
+```
+
+编辑 `widevine-1.1.rc`，在 Widevine 服务下面加一行。文件前面的数据迁移服务保持原样。
+
+```diff
+--- /vendor/etc/init/android.hardware.drm@1.1-service.widevine.rc
++++ /vendor/etc/init/android.hardware.drm@1.1-service.widevine.rc
+ service vendor.drm-widevine-hal-1-1 /vendor/bin/hw/android.hardware.drm@1.1-service.widevine
++    setenv FORCE_LEVEL3_OEMCRYPTO yes
+     class hal
+```
+
+`drm-1.0.rc` 中也加上同一行：
+
+```diff
+--- /vendor/etc/init/android.hardware.drm@1.0-service.rc
++++ /vendor/etc/init/android.hardware.drm@1.0-service.rc
+ service vendor.drm-hal-1-0 /vendor/bin/hw/android.hardware.drm@1.0-service
++    setenv FORCE_LEVEL3_OEMCRYPTO yes
+     class hal
+```
+
+### 写回配置，重建镜像
+
+这两份原始配置各占一个 4096 字节的数据块，加完一行之后仍然放得下。
+先在自己的镜像里查出块号，并核对修改后的文件大小：
+
+```bash
+# 镜像内路径：/etc/init/android.hardware.drm@1.1-service.widevine.rc
+#             /etc/init/android.hardware.drm@1.0-service.rc
+debugfs -R stats vendor.original.img
+rc11_block=$(debugfs -R 'blocks /etc/init/android.hardware.drm@1.1-service.widevine.rc' vendor.original.img | xargs)
+rc10_block=$(debugfs -R 'blocks /etc/init/android.hardware.drm@1.0-service.rc' vendor.original.img | xargs)
+printf 'Widevine block: %s\nLegacy DRM block: %s\n' "$rc11_block" "$rc10_block"
+wc -c widevine-1.1.rc drm-1.0.rc
+```
+
+确认块大小是 4096、每个块号输出只有一个整数、两个修改后的文件都小于 4096 字节。
+然后把内容写进原来的数据块，再更新 inode 中的文件大小。这样沿用原 inode，权限和
+SELinux 标签也保留下来。
+
+```bash
+# 电脑端工作镜像：vendor-work/vendor.img
+cp vendor.original.img vendor.img
+python3 "$AVBTOOL" erase_footer --image vendor.img
+dd if=widevine-1.1.rc of=vendor.img bs=4096 seek="$rc11_block" conv=notrunc
+dd if=drm-1.0.rc of=vendor.img bs=4096 seek="$rc10_block" conv=notrunc
+debugfs -w -R "sif /etc/init/android.hardware.drm@1.1-service.widevine.rc size $(wc -c < widevine-1.1.rc)" vendor.img
+debugfs -w -R "sif /etc/init/android.hardware.drm@1.0-service.rc size $(wc -c < drm-1.0.rc)" vendor.img
+e2fsck -fn vendor.img
+```
+
+再把镜像里的文件导出，与编辑后的配置比较。`stat` 输出里的 mode、UID/GID 和
+`security.selinux` 应保留原来的值。
+
+```bash
+# 电脑端核对文件：vendor-work/widevine-1.1.check.rc、vendor-work/drm-1.0.check.rc
+debugfs -R 'dump /etc/init/android.hardware.drm@1.1-service.widevine.rc widevine-1.1.check.rc' vendor.img
+debugfs -R 'dump /etc/init/android.hardware.drm@1.0-service.rc drm-1.0.check.rc' vendor.img
+cmp widevine-1.1.rc widevine-1.1.check.rc
+cmp drm-1.0.rc drm-1.0.check.rc
+debugfs -R 'stat /etc/init/android.hardware.drm@1.1-service.widevine.rc' vendor.img
+debugfs -R 'stat /etc/init/android.hardware.drm@1.0-service.rc' vendor.img
+```
+
+按原 vendor 的参数重建 hashtree、FEC 和 footer，然后转成 sparse 镜像：
+
+```bash
+# 电脑端工作镜像：vendor-work/vendor.img
+python3 "$AVBTOOL" add_hashtree_footer --image vendor.img \
+  --partition_name vendor --partition_size "$vendor_size" \
+  --hash_algorithm sha1 --salt "$vendor_salt" --fec_num_roots 2 \
+  --algorithm NONE --rollback_index "$vendor_index" \
+  --internal_release_string 'avbtool 1.1.0'
+python3 "$AVBTOOL" verify_image --image vendor.img
+python3 "$AVBTOOL" info_image --image vendor.img
+img2simg vendor.img vendor-l3.sparse.img 4096
+simg2img vendor-l3.sparse.img vendor-roundtrip.img
+cmp vendor.img vendor-roundtrip.img
+shasum -a 256 vendor.original.img vendor.img vendor-l3.sparse.img
+```
+
+重建结果中的 `Algorithm` 为 `NONE`，这份修改后的镜像配合现有关闭验证的顶层 vbmeta
+使用，引导器继续保持解锁。
+
+### 刷入 vendor，检查下次启动
+
+这次修改的是已经在运行旧系统的那个槽。按下面的例子操作前，确认 Android 和 fastboot
+报告的都是 A，再写 `vendor_a`。
+
+```bash
+# 电脑端输入：vendor-work/vendor-l3.sparse.img；电视端目标：vendor_a
+adb shell getprop ro.boot.slot_suffix
+adb reboot bootloader
+fastboot getvar current-slot
+fastboot -S 120M flash vendor_a vendor-l3.sparse.img
+fastboot reboot
+```
+
+这一步只写 `vendor_a`，保留原来的槽位选择、vbmeta 和用户数据。
+`-S 120M` 将单次传输控制在实测设备 128 MiB 的下载上限以内。
+
+网络 ADB 连回来后，检查启动和两个服务：
+
+```bash
+# 电视端状态：init 服务、/proc/sys/kernel/random/boot_id
+adb connect <device-ip>:5555
+adb shell getprop sys.boot_completed
+adb shell getprop init.svc.vendor.drm-widevine-hal-1-1
+adb shell getprop init.svc.vendor.drm-hal-1-0
+adb shell cat /proc/sys/kernel/random/boot_id
+adb shell getprop ro.boot.verifiedbootstate
+adb shell dumpsys dropbox
+```
+
+前五项依次应是 `1`、`running`、`running`、本次启动的 boot ID、`orange`。
+用能显示 Widevine `securityLevel` 的应用确认 `L3`，再按平时的声音输出方式播放视频，
+连续做几轮待机／唤醒，核对 boot ID 和 watchdog 条目的时间。之后正常重启一次，
+再测一轮，确认配置由 init 在新的一次启动中自动生效。
+
+我在第一次启动测了十轮，第二次测了三轮；4K 播放情况一起记在
+[研究记录](research.zh-CN.md#l3-下的播放情况)中。恢复原配置时，把保留的
+`vendor.original.img` 刷回同一个 vendor 分区即可。
+
+---
+
 ## 回到原来的固件
 
 ```bash

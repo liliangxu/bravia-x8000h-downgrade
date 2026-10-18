@@ -300,3 +300,85 @@ else if (strcmp("lock", TempData) == 0 || strcmp("unlock", TempData) == 0)
 实测：即使 Android 完全起不来，这组按键仍然触发了恢复出厂；屏幕依次显示 `erasing`、
 重启、欢迎向导。
 
+---
+
+## 降级后的待机卡死
+
+电视降级后能正常开机，也能播放视频。问题出在待机之后：有时按遥控器叫不醒，机身电源键
+也没反应，等一会儿电视又会自己重启。重新开机后看起来一切正常，偶尔还能成功唤醒一次。
+
+我最初沿着 HDMI ARC 和音频服务往下查。后来抓到一个关键状态：音频编码器已经收到了
+停止请求，但工作线程一直没有退出。
+
+### 音频线程在等谁
+
+卡住时，几层调用分别停在这些地方：
+
+| 位置 | 正在等什么 |
+| --- | --- |
+| `android.hardware.drm@1.1-service.widevine` | `OEMCrypto_Initialize LoadUsage` 中发往 `com.android.trusty.widevine` 的 `0x1442` 请求，正在等回复 |
+| `/vendor/lib/libmtal.so` | 音频编码器线程在 `MTAUDDEC_GetDolbyEfuse` 中等共享的 Trusty 事务信号量 |
+| `dtv_driver.ko` | 已经设置停止标志，等待 CPU 音频编码器线程退出 |
+| `dtv_svc` | 音频配置调用持有组件锁，电源回调等这把锁 |
+| `system_server` | 等同步的 Power HAL `setInteractive` 调用返回 |
+
+把它们接起来，原因就清楚了。Widevine 拿着共享信号量，等可信服务回复；音频编码器要做
+Dolby 初始化，也需要这个信号量。等到待机或唤醒流程要求编码器停下来，线程却退不出去，
+电源回调跟着堵住。最后 Android watchdog 超时，结束 `system_server`，电视重新启动。
+
+这也解释了为什么有时第一次唤醒成功，下一次才卡。原来的编码器线程还正常，可以顺利退出；
+唤醒后新建的线程才堵在共享信号量上，下一次切换电源状态时就暴露出来了。
+
+我做了两组对照。开机时，在 Widevine 开始初始化之前停掉两个服务入口，连续三轮待机／
+唤醒都成功。之后用标准 MediaDrm 初始化并查询 `securityLevel`，同一笔可信服务请求和
+信号量等待再次出现；接下来停止编码器时又卡住，最终触发 watchdog 重启。
+
+这些状态是在诊断系统中通过 root ADB 读取的，音频库和 framework 代码保持原版。
+直接抓到的最内层状态是 Widevine 在等待可信服务回复，后面的音频和电源阻塞链已经串起来了。
+
+### 让 Widevine 直接走 L3
+
+Widevine 是视频服务使用的一套 DRM。L1 走硬件可信执行环境，L3 走软件路径。
+
+解锁引导器后，Verified Boot 变成 `orange`。L1 依赖可信启动链和受保护的密钥处理，
+[AOSP 早期的 Widevine 集成说明](https://android.googlesource.com/platform/docs/source.android.com/+/idea133-weekly-release/src/devices/drm.jd)里有这部分要求。
+解锁后的系统不再提供原有的启动验证保证，因此这里使用软件 L3，不再依赖出厂状态下的
+L1 能力。L1 不可用时，正常预期是回退到仍可工作的 L3，而不是整个 DRM 服务卡住。
+
+这次遇到的不只是失去 L1。故障那次查询在 21:01:12.350 打出了
+`L3 Initialized. Trying L1.`，紧接着 21:01:12.366 就进入了
+`OEMCrypto_Initialize LoadUsage`。软件 L3 已经初始化成功，但适配层随后继续尝试
+L1，卡在了前面那笔可信服务请求上。L1 初始化没有返回，也就没能正常结束初始化并
+确定使用 L3，连 `securityLevel` 查询都没有返回。
+
+我在 Android 9 的原版库里找到了一个现成的启动开关：`FORCE_LEVEL3_OEMCRYPTO=yes`。
+
+这个开关同时存在于 `/vendor/lib/libwvhidl.so` 和旧接口使用的
+`/vendor/lib/mediadrm/libwvdrmengine.so`。设置之后，适配层在 L3 初始化成功后就结束
+初始化，不再继续尝试 L1/OEMCrypto。两个 DRM 服务都可能加载 Widevine，所以两处
+启动配置都要加。
+
+实际改动是给两个服务的 init 配置各加一行 `setenv`。重新生成 `vendor.img` 后，只刷入
+`vendor_a`，下次开机由 init 正常启动原来的服务。库文件、服务身份和 SELinux 域都没有
+改动。具体文件和镜像处理方法见[操作步骤](procedure.zh-CN.md#处理待机卡死)。
+
+改完后，`ro.boot.verifiedbootstate` 仍然是 `orange`，表示引导器保持解锁。
+`green`／`orange` 说的是启动验证状态，L1／L3 说的是 Widevine 的 DRM 路径。
+这次改变的是 Widevine 的启动方式，启动验证状态没有变化。属性的定义可以对照
+[AOSP 启动流程说明](https://source.android.com/docs/security/features/verifiedboot/boot-flow)。
+
+### L3 下的播放情况
+
+持久化配置刷入后，我做了两次独立启动，每次都通过标准 MediaDrm 接口查到了 `L3`。
+第一次启动连续测了十轮待机／唤醒，第二次又测了三轮。13 轮都正常完成，采样时音频编码器
+没有再等那把 Trusty 信号量，也没有新增 watchdog 或自行重启。最后 ARC 已建立，
+系统音频处于启用状态。
+
+实际播放的 4K 视频也正常。DRM 等级和视频分辨率是两回事，选择 L3 后，视频解码器仍然
+照常工作。在线视频能拿到什么画质，还要看平台的授权策略：要求硬件 DRM 的服务可能在
+L3 下限制清晰度，或拒绝播放。这部分行为在 Android 的
+[`MediaDrm.openSession(int)` 文档](https://developer.android.com/reference/android/media/MediaDrm#openSession(int))里有说明。
+
+上面的连续测试覆盖了启动、L3 等级查询和待机唤醒。HDR、DD+／Atmos 播放以及长期使用，
+还需要另外做播放测试。
+

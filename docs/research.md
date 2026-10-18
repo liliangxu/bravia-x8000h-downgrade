@@ -319,3 +319,109 @@ assumption is wrong.
 Measured: with Android unable to start at all, the key combination still triggered the
 factory reset — the screen showed `erasing`, then a reboot, then the setup wizard.
 
+---
+
+## Standby hangs after the downgrade
+
+The TV booted normally and played video. The trouble showed up later: after I
+put it in standby, neither the remote nor the button on the TV would wake it.
+Eventually it restarted itself. A fresh boot could look fine, and an occasional
+successful wake made the problem harder to pin down.
+
+I first followed HDMI ARC and the audio services. The useful lead was an audio
+encoder thread that was still present after it had been told to stop.
+
+### Following the blocked audio thread
+
+The fault snapshots connected the waits across these components:
+
+| Component | What it was waiting for |
+| --- | --- |
+| `android.hardware.drm@1.1-service.widevine` | A reply from `com.android.trusty.widevine` during `OEMCrypto_Initialize LoadUsage`, command `0x1442` |
+| `/vendor/lib/libmtal.so` | The shared Trusty transaction semaphore, from `MTAUDDEC_GetDolbyEfuse` in the audio encoder worker |
+| `dtv_driver.ko` | The CPU audio encoder worker to exit after its stop flag was set |
+| `dtv_svc` | The audio/component lock held by the configuration call waiting on that encoder |
+| `system_server` | The synchronous Power HAL `setInteractive` call to return |
+
+Widevine had acquired the shared semaphore and was waiting for its trusted
+service reply. The encoder needed that same semaphore to finish its Dolby
+initialization. When a power transition tried to stop the encoder, the worker
+could not exit, the power callback stayed blocked, and Android's watchdog
+restarted `system_server` and the TV.
+
+That also explained the successful first wake. An existing healthy encoder
+could shut down normally; the replacement worker created on wake then got stuck
+on the semaphore. The next power transition was the one that hung.
+
+I checked the dependency in both directions. Stopping both Widevine service
+paths before initialization gave three successful standby/wake cycles. Later,
+a standard MediaDrm initialization and `securityLevel` query brought back the
+same trusted request and semaphore wait. The next encoder-stop sequence hung
+again and ended in a watchdog restart.
+
+For these samples I used a diagnostic system image with root ADB to read the
+process and kernel state. The audio libraries and framework code were the
+original firmware versions. The last directly observed step is Widevine waiting
+for the trusted-service reply; the snapshots show how that wait reaches the
+audio encoder and the power callback.
+
+### Starting Widevine in L3
+
+Widevine handles DRM for video services. L1 uses hardware-backed trusted
+execution; L3 uses the software path.
+
+Unlocking the bootloader changes Verified Boot to `orange`. L1 relies on a
+trusted boot chain and protected key handling, as described in
+[AOSP's archived Widevine integration notes](https://android.googlesource.com/platform/docs/source.android.com/+/idea133-weekly-release/src/devices/drm.jd).
+The unlocked system no longer provides the same verified-boot assurance, so
+I use software L3 rather than rely on the factory L1 capability. When L1 is
+unavailable, the expected fallback is a working L3 path, not a hung DRM service.
+
+The failure here went beyond losing L1. The query logged
+`L3 Initialized. Trying L1.` at 21:01:12.350, followed by
+`OEMCrypto_Initialize LoadUsage` at 21:01:12.366. Software L3 had initialized,
+but the adapter then entered the L1/OEMCrypto path and waited indefinitely for
+the trusted-service reply described above. Instead of returning an L1 failure
+and settling on L3, initialization stayed blocked. The `securityLevel` query
+never returned: the plugin had not finished initialization with L3 as its
+usable level.
+
+The original Android 9 vendor libraries have a startup switch for stopping
+after L3 initialization: `FORCE_LEVEL3_OEMCRYPTO=yes`.
+
+I found the switch in `/vendor/lib/libwvhidl.so` and the legacy plugin,
+`/vendor/lib/mediadrm/libwvdrmengine.so`. With this setting, the adapter finishes
+initialization after L3 succeeds instead of continuing into L1/OEMCrypto.
+Both DRM service definitions need the environment setting, because either
+service can load Widevine.
+
+The persistent change adds one `setenv` line to each service's init file. I
+rebuilt `vendor.img`, wrote it to `vendor_a`, and let init start the original
+services on the next boot. The libraries, service identities and SELinux
+domains stayed as they were. The [procedure](procedure.md#fixing-the-standby-hang)
+shows the two files and the image preparation steps.
+
+The boot property `ro.boot.verifiedbootstate` stayed `orange`: the bootloader
+was still unlocked. `green` and `orange` describe boot verification; L1 and L3
+describe Widevine's DRM path. Here the change was in Widevine startup, while
+the boot state stayed the same. The [AOSP boot-flow documentation](https://source.android.com/docs/security/features/verifiedboot/boot-flow)
+describes how the bootloader reports that state.
+
+### Playback in L3
+
+After the persistent change, a standard MediaDrm `securityLevel` query returned
+`L3` on two separate boots. I ran ten standby/wake cycles on the first boot and
+three on the second. All 13 completed, the encoder workers were free of the
+captured Trusty wait, and there were no new watchdog entries or automatic
+restarts. ARC was established and system audio was active at the end.
+
+4K video also played normally in my playback check. Video resolution and DRM
+security level are separate properties: selecting L3 leaves the video decoder
+in place. For a streaming service, the available quality also depends on its
+license policy. A service that requires hardware-backed DRM may limit the
+resolution or refuse playback in L3; Android documents this behavior in
+[`MediaDrm.openSession(int)`](https://developer.android.com/reference/android/media/MediaDrm#openSession(int)).
+
+The repeated tests above cover startup, the reported L3 level, and standby/wake.
+HDR, DD+/Atmos playback, and long-term daily use remain separate playback checks.
+
