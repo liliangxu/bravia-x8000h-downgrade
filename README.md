@@ -29,6 +29,7 @@ not establish compatibility with other models or regions.
   would not boot, the replacement vbmeta, how fastboot is entered, and the userdata problem.
 - [Procedure](docs/procedure.md) — what to prepare, where the firmware comes from, the
   commands, the USB connection, the factory reset, and the checks.
+- [Firmware downloads and supported models](docs/firmware.md) — China-region firmware download links and model lists.
 
 The procedure follows the successful run. The notes explain the decisions needed
 to reproduce it; the full investigation and post-downgrade update management are

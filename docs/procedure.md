@@ -25,6 +25,8 @@ All commands below run on the computer. Connect one device only.
 
 ## Where the firmware comes from
 
+Available versions, download links, and model information are listed in [Firmware downloads and supported models](firmware.md).
+
 Firmware packages come from the device's OTA distribution server, not from the support
 pages. Support pages list the current version only.
 
